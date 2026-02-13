@@ -15,7 +15,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Optional
+from typing import Iterable, Optional
 
 import numpy as np
 import pandas as pd
@@ -267,6 +267,55 @@ def build_dataset(input_df: pd.DataFrame, params: Optional[TrendStrengthParams] 
     return final_df[ordered_cols]
 
 
+def fetch_yfinance_data(symbols: list[str], start: str, end: Optional[str] = None) -> pd.DataFrame:
+    """Download daily close data from yfinance and return (date, symbol, close).
+
+    Parameters
+    ----------
+    symbols
+        List of tickers, e.g. ["SPY", "QQQ"].
+    start, end
+        Date range passed to yfinance download.
+    """
+    try:
+        import yfinance as yf
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "yfinance is required for --symbols mode. Install with: pip install yfinance"
+        ) from exc
+
+    if not symbols:
+        raise ValueError("No symbols provided for yfinance download.")
+
+    raw = yf.download(
+        tickers=symbols,
+        start=start,
+        end=end,
+        interval="1d",
+        auto_adjust=False,
+        progress=False,
+        group_by="column",
+        threads=True,
+    )
+    if raw is None or raw.empty:
+        raise ValueError("No data returned from yfinance for the requested symbols/date range.")
+
+    # Multi-symbol returns columns as MultiIndex (field, symbol).
+    if isinstance(raw.columns, pd.MultiIndex):
+        close_wide = raw["Close"].copy()
+        close_long = close_wide.stack(dropna=False).reset_index()
+        close_long.columns = ["date", "symbol", "close"]
+    else:
+        # Single symbol case can return a flat column index.
+        sym = symbols[0]
+        close_long = raw.reset_index()[["Date", "Close"]].rename(columns={"Date": "date", "Close": "close"})
+        close_long["symbol"] = sym
+        close_long = close_long[["date", "symbol", "close"]]
+
+    close_long = close_long.dropna(subset=["close"]).reset_index(drop=True)
+    return close_long
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compute Trend Strength v1.0 research dataset.")
     parser.add_argument(
@@ -276,6 +325,24 @@ def main() -> None:
         help="Optional CSV input path. Must include date, symbol, close columns.",
     )
     parser.add_argument(
+        "--symbols",
+        type=str,
+        default=None,
+        help="Comma-separated ticker list for yfinance pull, e.g. 'SPY,QQQ,AAPL'.",
+    )
+    parser.add_argument(
+        "--start",
+        type=str,
+        default="2000-01-01",
+        help="Start date for yfinance mode (YYYY-MM-DD).",
+    )
+    parser.add_argument(
+        "--end",
+        type=str,
+        default=None,
+        help="Optional end date for yfinance mode (YYYY-MM-DD).",
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default="trend_strength_dataset.parquet",
@@ -283,10 +350,14 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.input is None:
-        raise ValueError("Please provide --input CSV path with date, symbol, close columns.")
+    if args.symbols:
+        symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+        df = fetch_yfinance_data(symbols=symbols, start=args.start, end=args.end)
+    elif args.input is not None:
+        df = pd.read_csv(args.input)
+    else:
+        raise ValueError("Provide either --symbols for yfinance pull or --input for CSV.")
 
-    df = pd.read_csv(args.input)
     dataset = build_dataset(df)
     _run_assert_checks(dataset)
 
